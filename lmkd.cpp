@@ -91,9 +91,9 @@ static inline void trace_kill_end() {}
 #define PROC_STATUS_TGID_FIELD "Tgid:"
 #define PROC_STATUS_RSS_FIELD "VmRSS:"
 #define PROC_STATUS_SWAP_FIELD "VmSwap:"
-#define LINE_MAX 128
 
 #define PERCEPTIBLE_APP_ADJ 200
+#define PREVIOUS_APP_ADJ 700
 
 /* Android Logger event logtags (see event.logtags) */
 #define KILLINFO_LOG_TAG 10195355
@@ -194,6 +194,7 @@ static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1 };
 static bool pidfd_supported;
 static int last_kill_pid_or_fd = -1;
 static struct timespec last_kill_tm;
+static bool monitors_initialized;
 
 /* lmkd configurable parameters */
 static bool debug_process_killing;
@@ -203,6 +204,7 @@ static int64_t downgrade_pressure;
 static bool low_ram_device;
 static bool kill_heaviest_task;
 static unsigned long kill_timeout_ms;
+static int pressure_after_kill_min_score;
 static bool use_minfree_levels;
 static bool per_app_memcg;
 static int swap_free_low_percentage;
@@ -216,6 +218,7 @@ static int64_t filecache_min_kb;
 static int64_t stall_limit_critical;
 static bool use_psi_monitors = false;
 static int kpoll_fd;
+static bool delay_monitors_until_boot;
 static struct psi_threshold psi_thresholds[VMPRESS_LEVEL_COUNT] = {
     { PSI_SOME, 70 },    /* 70ms out of 1sec for partial stall */
     { PSI_SOME, 100 },   /* 100ms out of 1sec for partial stall */
@@ -465,6 +468,7 @@ enum vmstat_field {
     VS_PGSCAN_KSWAPD,
     VS_PGSCAN_DIRECT,
     VS_PGSCAN_DIRECT_THROTTLE,
+    VS_PGREFILL,
     VS_FIELD_COUNT
 };
 
@@ -477,6 +481,7 @@ static const char* const vmstat_field_names[VS_FIELD_COUNT] = {
     "pgscan_kswapd",
     "pgscan_direct",
     "pgscan_direct_throttle",
+    "pgrefill",
 };
 
 union vmstat {
@@ -489,6 +494,7 @@ union vmstat {
         int64_t pgscan_kswapd;
         int64_t pgscan_direct;
         int64_t pgscan_direct_throttle;
+        int64_t pgrefill;
     } field;
     int64_t arr[VS_FIELD_COUNT];
 };
@@ -545,8 +551,8 @@ static uint16_t killcnt[MAX_DISTINCT_OOM_ADJ];
 static int killcnt_free_idx = 0;
 static uint32_t killcnt_total = 0;
 
-/* PAGE_SIZE / 1024 */
-static long page_k;
+static int pagesize;
+static long page_k; /* page size in kB */
 
 static bool update_props();
 static bool init_monitors();
@@ -622,7 +628,7 @@ static ssize_t read_all(int fd, char *buf, size_t max_len)
  */
 static char *reread_file(struct reread_data *data) {
     /* start with page-size buffer and increase if needed */
-    static ssize_t buf_size = PAGE_SIZE;
+    static ssize_t buf_size = pagesize;
     static char *new_buf, *buf = NULL;
     ssize_t size;
 
@@ -810,22 +816,6 @@ static void stats_write_lmk_kill_occurred_pid(int pid, struct kill_stat *kill_st
     }
 }
 
-/*
- * Write the state_changed over the data socket to be propagated via AMS to statsd
- */
-static void stats_write_lmk_state_changed(enum lmk_state state) {
-    LMKD_CTRL_PACKET packet_state_changed;
-    const size_t len = lmkd_pack_set_state_changed(packet_state_changed, state);
-    if (len == 0) {
-        return;
-    }
-    for (int i = 0; i < MAX_DATA_CONN; i++) {
-        if (data_sock[i].sock >= 0 && data_sock[i].async_event_mask & 1 << LMK_ASYNC_EVENT_STAT) {
-            ctrl_data_write(i, (char*)packet_state_changed, len);
-        }
-    }
-}
-
 static void poll_kernel(int poll_fd) {
     if (poll_fd == -1) {
         // not waiting
@@ -859,7 +849,7 @@ static void poll_kernel(int poll_fd) {
         if (fields_read == 10 && group_leader_pid == pid) {
             ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid);
             mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
-            mem_st.rss_in_bytes = rss_in_pages * PAGE_SIZE;
+            mem_st.rss_in_bytes = rss_in_pages * pagesize;
 
             struct kill_stat kill_st = {
                 .uid = static_cast<int32_t>(uid),
@@ -1120,7 +1110,7 @@ static void cmd_procprio(LMKD_CTRL_PACKET packet, int field_count, struct ucred 
     bool is_system_server;
     struct passwd *pwdrec;
     int64_t tgid;
-    char buf[PAGE_SIZE];
+    char buf[pagesize];
 
     lmkd_pack_get_procprio(packet, field_count, &params);
 
@@ -1526,7 +1516,7 @@ static void ctrl_command_handler(int dsock_idx) {
             goto wronglen;
         result = -1;
         if (update_props()) {
-            if (!use_inkernel_interface) {
+            if (!use_inkernel_interface && monitors_initialized) {
                 /* Reinitialize monitors to apply new settings */
                 destroy_monitors();
                 if (init_monitors()) {
@@ -1548,6 +1538,24 @@ static void ctrl_command_handler(int dsock_idx) {
             ALOGE("New configuration is not supported. Exiting...");
             exit(1);
         }
+        break;
+    case LMK_START_MONITORING:
+        if (nargs != 0)
+            goto wronglen;
+        // Registration is needed only if it was skipped earlier.
+        if (monitors_initialized)
+            return;
+        if (!property_get_bool("sys.boot_completed", false)) {
+            ALOGE("LMK_START_MONITORING cannot be handled before boot completed");
+            return;
+        }
+
+        if (!init_monitors()) {
+            /* Failure to start psi monitoring, crash to be restarted */
+            ALOGE("Failure to initialize monitoring. Exiting...");
+            exit(1);
+        }
+        ALOGI("Initialized monitors after boot completed.");
         break;
     default:
         ALOGE("Received unknown command code %d", cmd);
@@ -2315,7 +2323,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     int64_t tgid;
     int64_t rss_kb;
     int64_t swap_kb;
-    char buf[PAGE_SIZE];
+    char buf[pagesize];
     char desc[LINE_MAX];
 
     if (!procp->valid || !read_proc_status(pid, buf, sizeof(buf))) {
@@ -2423,7 +2431,6 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
                                  struct psi_data *pd) {
     int i;
     int killed_size = 0;
-    bool lmk_state_change_start = false;
     bool choose_heaviest_task = kill_heaviest_task;
 
     for (i = OOM_SCORE_ADJ_MAX; i >= min_score_adj; i--) {
@@ -2446,20 +2453,12 @@ static int find_and_kill_process(int min_score_adj, struct kill_info *ki, union 
 
             killed_size = kill_one_process(procp, min_score_adj, ki, mi, wi, tm, pd);
             if (killed_size >= 0) {
-                if (!lmk_state_change_start) {
-                    lmk_state_change_start = true;
-                    stats_write_lmk_state_changed(STATE_START);
-                }
                 break;
             }
         }
         if (killed_size) {
             break;
         }
-    }
-
-    if (lmk_state_change_start) {
-        stats_write_lmk_state_changed(STATE_STOP);
     }
 
     return killed_size;
@@ -2591,6 +2590,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     static int64_t base_file_lru;
     static int64_t init_pgscan_kswapd;
     static int64_t init_pgscan_direct;
+    static int64_t init_pgrefill;
     static bool killing;
     static int thrashing_limit = thrashing_limit_pct;
     static struct zone_watermarks watermarks;
@@ -2676,9 +2676,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
     if (vs.field.pgscan_direct != init_pgscan_direct) {
         init_pgscan_direct = vs.field.pgscan_direct;
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
+        init_pgrefill = vs.field.pgrefill;
         reclaim = DIRECT_RECLAIM;
     } else if (vs.field.pgscan_kswapd != init_pgscan_kswapd) {
         init_pgscan_kswapd = vs.field.pgscan_kswapd;
+        init_pgrefill = vs.field.pgrefill;
+        reclaim = KSWAPD_RECLAIM;
+    } else if (vs.field.pgrefill != init_pgrefill) {
+        init_pgrefill = vs.field.pgrefill;
         reclaim = KSWAPD_RECLAIM;
     } else if (workingset_refault_file == prev_workingset_refault) {
         /*
@@ -2765,6 +2770,7 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
          * This might happen when a process is consuming memory faster than reclaim can
          * free even after a kill. Mostly happens when running memory stress tests.
          */
+        min_score_adj = pressure_after_kill_min_score;
         kill_reason = PRESSURE_AFTER_KILL;
         strncpy(kill_desc, "min watermark is breached even after kill", sizeof(kill_desc));
     } else if (level == VMPRESS_LEVEL_CRITICAL && events != 0) {
@@ -2842,6 +2848,14 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
             /* File cache is big enough, stop checking */
             check_filecache = false;
         }
+    }
+
+    /* Check if a cached app should be killed */
+    if (kill_reason == NONE && wmark < WMARK_HIGH) {
+        kill_reason = LOW_MEM;
+        snprintf(kill_desc, sizeof(kill_desc), "%s watermark is breached",
+            wmark < WMARK_LOW ? "min" : "low");
+        min_score_adj = PREVIOUS_APP_ADJ + 1;
     }
 
     /* Kill a process if necessary */
@@ -3206,7 +3220,7 @@ static MemcgVersion __memcg_version() {
     if (!CgroupGetControllerPath("memory", &memcg_path)) {
         return MemcgVersion::kNotFound;
     }
-    return CgroupGetControllerPath(CGROUPV2_CONTROLLER_NAME, &cgroupv2_path) &&
+    return CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &cgroupv2_path) &&
                            cgroupv2_path == memcg_path
                    ? MemcgVersion::kV2
                    : MemcgVersion::kV1;
@@ -3368,6 +3382,7 @@ static bool init_monitors() {
     } else {
         ALOGI("Using vmpressure for memory pressure detection");
     }
+    monitors_initialized = true;
     return true;
 }
 
@@ -3451,10 +3466,9 @@ static int init(void) {
     int i;
     int ret;
 
-    page_k = sysconf(_SC_PAGESIZE);
-    if (page_k == -1)
-        page_k = PAGE_SIZE;
-    page_k /= 1024;
+    // Initialize page size
+    pagesize = getpagesize();
+    page_k = pagesize / 1024;
 
     epollfd = epoll_create(MAX_EPOLL_EVENTS);
     if (epollfd == -1) {
@@ -3507,8 +3521,13 @@ static int init(void) {
             }
         }
     } else {
-        if (!init_monitors()) {
-            return -1;
+        // Do not register monitors until boot completed for devices configured
+        // for delaying monitors. This is done to save CPU cycles for low
+        // resource devices during boot up.
+        if (!delay_monitors_until_boot || property_get_bool("sys.boot_completed", false)) {
+            if (!init_monitors()) {
+                return -1;
+            }
         }
         /* let the others know it does support reporting kills */
         property_set("sys.lmk.reportkills", "1");
@@ -3754,6 +3773,8 @@ static bool update_props() {
     low_ram_device = property_get_bool("ro.config.low_ram", false);
     kill_timeout_ms =
         (unsigned long)GET_LMK_PROPERTY(int32, "kill_timeout_ms", 100);
+    pressure_after_kill_min_score =
+        (unsigned long)GET_LMK_PROPERTY(int32, "pressure_after_kill_min_score", 0);
     use_minfree_levels =
         GET_LMK_PROPERTY(bool, "use_minfree_levels", false);
     per_app_memcg =
@@ -3770,10 +3791,11 @@ static bool update_props() {
     thrashing_limit_decay_pct = clamp(0, 100, GET_LMK_PROPERTY(int32, "thrashing_limit_decay",
         low_ram_device ? DEF_THRASHING_DECAY_LOWRAM : DEF_THRASHING_DECAY));
     thrashing_critical_pct = std::max(
-            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", thrashing_limit_pct * 2));
+            0, GET_LMK_PROPERTY(int32, "thrashing_limit_critical", thrashing_limit_pct * 3));
     swap_util_max = clamp(0, 100, GET_LMK_PROPERTY(int32, "swap_util_max", 100));
     filecache_min_kb = GET_LMK_PROPERTY(int64, "filecache_min_kb", 0);
     stall_limit_critical = GET_LMK_PROPERTY(int64, "stall_limit_critical", 100);
+    delay_monitors_until_boot = GET_LMK_PROPERTY(bool, "delay_monitors_until_boot", false);
 
     reaper.enable_debug(debug_process_killing);
 
