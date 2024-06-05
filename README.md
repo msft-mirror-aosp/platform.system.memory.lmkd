@@ -88,6 +88,24 @@ properties:
   - `ro.lmk.psi_complete_stall_ms`: complete PSI stall threshold in milliseconds for
                                  triggering critical memory notification. Default =
                                  700
+  - `ro.lmk.pressure_after_kill_min_score`: min oom_adj_score score threshold for
+                                 cycle after kill used to allow blocking of killing
+                                 critical processes when not enough memory was freed
+                                 in a kill cycle. Default score = 0.
+  - `ro.lmk.direct_reclaim_threshold_ms`: direct reclaim duration threshold in
+                                 milliseconds to consider the system as stuck in
+                                 direct reclaim. Default = 0 (disabled)
+  - `ro.lmk.swap_compression_ratio`: swap average compression ratio to be used when
+                                 estimating how much data can be swapped. Setting it
+                                 to 0 will ignore available memory and assume that
+                                 configured swap size can be always utilized fully.
+                                 Default = 1 (no compression).
+  - `ro.lmk.lowmem_min_oom_score`: min oom_score_adj level used to select processes
+                                 to kill when memory is critically low. Setting it
+                                 to 1001 will prevent any kills for this reason. Min
+                                 acceptable value is 201 (apps up to perceptible).
+                                 Default = 701 (all cached apps excluding the last
+                                 active one).
 
 lmkd will set the following Android properties according to current system
 configurations:
