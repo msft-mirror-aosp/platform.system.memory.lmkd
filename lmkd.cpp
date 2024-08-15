@@ -40,6 +40,8 @@
 #include <shared_mutex>
 #include <vector>
 
+#include <BpfSyscallWrappers.h>
+#include <android-base/unique_fd.h>
 #include <bpf/KernelUtils.h>
 #include <bpf/WaitForProgsLoaded.h>
 #include <cutils/properties.h>
@@ -59,9 +61,6 @@
 #include "reaper.h"
 #include "statslog.h"
 #include "watchdog.h"
-
-#define BPF_FD_JUST_USE_INT
-#include "BpfSyscallWrappers.h"
 
 /*
  * Define LMKD_TRACE_KILLS to record lmkd kills in kernel traces
@@ -808,9 +807,9 @@ static int ctrl_data_write(int dsock_idx, char* buf, size_t bufsz) {
  * Write the pid/uid pair over the data socket, note: all active clients
  * will receive this unsolicited notification.
  */
-static void ctrl_data_write_lmk_kill_occurred(pid_t pid, uid_t uid) {
+static void ctrl_data_write_lmk_kill_occurred(pid_t pid, uid_t uid, int64_t rss_kb) {
     LMKD_CTRL_PACKET packet;
-    size_t len = lmkd_pack_set_prockills(packet, pid, uid);
+    size_t len = lmkd_pack_set_prockills(packet, pid, uid, static_cast<int>(rss_kb));
 
     for (int i = 0; i < MAX_DATA_CONN; i++) {
         if (data_sock[i].sock >= 0 && data_sock[i].async_event_mask & 1 << LMK_ASYNC_EVENT_KILL) {
@@ -867,6 +866,7 @@ static void poll_kernel(int poll_fd) {
         int16_t min_score_adj;
         int64_t starttime;
         char* taskname = 0;
+        int64_t rss_kb;
 
         int fields_read =
                 sscanf(rd_buf,
@@ -877,9 +877,10 @@ static void poll_kernel(int poll_fd) {
 
         /* only the death of the group leader process is logged */
         if (fields_read == 10 && group_leader_pid == pid) {
-            ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid);
-            mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
             mem_st.rss_in_bytes = rss_in_pages * pagesize;
+            rss_kb = mem_st.rss_in_bytes >> 10;
+            ctrl_data_write_lmk_kill_occurred((pid_t)pid, (uid_t)uid, rss_kb);
+            mem_st.process_start_time_ns = starttime * (NS_PER_SEC / sysconf(_SC_CLK_TCK));
 
             struct kill_stat kill_st = {
                 .uid = static_cast<int32_t>(uid),
@@ -1050,7 +1051,7 @@ static bool read_proc_status(int pid, char *buf, size_t buf_sz) {
 
     size = read_all(fd, buf, buf_sz - 1);
     close(fd);
-    if (size < 0) {
+    if (size <= 0) {
         return false;
     }
     buf[size] = 0;
@@ -1118,7 +1119,7 @@ static char *proc_get_name(int pid, char *buf, size_t buf_size) {
     }
     ret = read_all(fd, buf, buf_size - 1);
     close(fd);
-    if (ret < 0) {
+    if (ret <= 0) {
         return NULL;
     }
     buf[ret] = '\0';
@@ -1494,7 +1495,6 @@ static void handle_io_uring_procs_prio(const struct lmk_procs_prio& params, cons
     char buffers[PROCS_PRIO_MAX_RECORD_COUNT]
                 [256]; /* Reading proc/stat and write to proc/oom_score_adj */
     char path[PROCFS_PATH_MAX];
-    char val[20];
     int64_t tgid;
     int ret;
     int num_requests = 0;
@@ -2116,12 +2116,12 @@ static bool meminfo_parse_line(char *line, union meminfo *mi) {
 }
 
 static int64_t read_gpu_total_kb() {
-    static int fd = android::bpf::bpfFdGet(
-            "/sys/fs/bpf/map_gpuMem_gpu_mem_total_map", BPF_F_RDONLY);
+    static android::base::unique_fd fd(
+            android::bpf::mapRetrieveRO("/sys/fs/bpf/map_gpuMem_gpu_mem_total_map"));
     static constexpr uint64_t kBpfKeyGpuTotalUsage = 0;
     uint64_t value;
 
-    if (fd < 0) {
+    if (!fd.ok()) {
         return 0;
     }
 
@@ -2683,7 +2683,7 @@ static int kill_one_process(struct proc* procp, int min_oom_score, struct kill_i
     kill_st.free_swap_kb = get_free_swap(mi) * page_k;
     stats_write_lmk_kill_occurred(&kill_st, mem_st);
 
-    ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid);
+    ctrl_data_write_lmk_kill_occurred((pid_t)pid, uid, rss_kb);
 
     result = rss_kb / page_k;
 
