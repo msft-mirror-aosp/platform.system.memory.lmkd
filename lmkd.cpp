@@ -211,6 +211,7 @@ static int mpevfd[VMPRESS_LEVEL_COUNT] = { -1, -1, -1 };
 static bool pidfd_supported;
 static int last_kill_pid_or_fd = -1;
 static struct timespec last_kill_tm;
+enum vmpressure_level prev_level = VMPRESS_LEVEL_LOW;
 static bool monitors_initialized;
 static bool boot_completed_handled = false;
 
@@ -2731,6 +2732,20 @@ static void mp_event_psi(int data, uint32_t events, struct polling_params *poll_
         return;
     }
 
+    if (events > 0 ) {
+        /* Ignore a lower event within the first polling window. */
+        if (level < prev_level) {
+            if (debug_process_killing)
+                ALOGI("Ignoring %s pressure event; occurred too soon.",
+                       level_name[level]);
+            return;
+        }
+        prev_level = level;
+    } else {
+        /* Reset event level after the first polling window. */
+        prev_level = VMPRESS_LEVEL_LOW;
+    }
+
     record_wakeup_time(&curr_tm, events ? Event : Polling, &wi);
 
     bool kill_pending = is_kill_pending();
@@ -3825,6 +3840,7 @@ static void call_handler(struct event_handler_info* handler_info,
          */
         poll_params->poll_start_tm = curr_tm;
         poll_params->poll_handler = handler_info;
+        poll_params->last_poll_tm = curr_tm;
         break;
     case POLLING_PAUSE:
         poll_params->paused_handler = handler_info;
